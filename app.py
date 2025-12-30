@@ -14,23 +14,15 @@ st.set_page_config(page_title="Mishr@lgobot Final", layout="wide", initial_sideb
 st.markdown("""
     <style>
         .stApp { background-color: #000000; color: #e0e0e0; font-family: 'Roboto', sans-serif; }
-        
-        /* Card Design */
         .card { 
             background: linear-gradient(145deg, #111, #1a1a1a); 
             border: 1px solid #333; border-radius: 12px; padding: 15px; margin-bottom: 10px; 
         }
-        
-        /* Buttons */
         div.stButton > button { width: 100%; border-radius: 8px; font-weight: bold; border: none; height: 45px; }
         button[kind="primary"] { background-color: #00e676; color: black; }
         button[kind="secondary"] { background-color: #ff1744; color: white; }
-        
-        /* Colors */
         .bull { color: #00e676; font-weight: bold; } 
         .bear { color: #ff1744; font-weight: bold; }
-        
-        /* Hide Extra Elements */
         #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
     </style>
 """, unsafe_allow_html=True)
@@ -53,7 +45,7 @@ defaults = {
 for key, val in defaults.items():
     if key not in st.session_state: st.session_state[key] = val
 
-# --- 3. HELPERS (Time & Logs) ---
+# --- 3. HELPERS ---
 def add_log(msg, type_="INFO"):
     ts = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')
     st.session_state.logs.insert(0, f"[{ts}] [{type_}] {msg}")
@@ -62,7 +54,6 @@ def add_log(msg, type_="INFO"):
 def check_market_time(exch_type):
     tz = pytz.timezone('Asia/Kolkata')
     now = datetime.now(tz).time()
-    
     if exch_type == "CRYPTO": return True
     elif exch_type == "MCX": return dtime(9, 0) <= now <= dtime(23, 30)
     elif exch_type in ["INDEX", "EQUITY"]: return dtime(9, 15) <= now <= dtime(15, 30)
@@ -102,21 +93,17 @@ if st.session_state.token_df is None:
 def get_angel_token(symbol, strike=None, opt_type=None, type_="EQUITY"):
     df = st.session_state.token_df
     if df is None: return None, None, "NSE"
-    
     if type_ == "MCX":
         res = df[(df['name'] == symbol) & (df['instrumenttype'] == 'FUTCOM')]
         if not res.empty: return res.sort_values('expiry').iloc[0]['token'], res.iloc[0]['symbol'], "MCX"
-        
     elif type_ == "INDEX" and strike:
         s_str = str(int(strike))
         name = "NIFTY" if "NIFTY" in symbol else "BANKNIFTY"
         res = df[(df['name'] == name) & (df['symbol'].str.endswith(opt_type)) & (df['symbol'].str.contains(s_str))]
         if not res.empty: return res.sort_values('expiry').iloc[0]['token'], res.iloc[0]['symbol'], "NFO"
-        
     elif type_ == "EQUITY":
         res = df[(df['name'] == symbol) & (df['exch_seg'] == 'NSE') & (df['symbol'].str.endswith('-EQ'))]
         if not res.empty: return res.iloc[0]['token'], res.iloc[0]['symbol'], "NSE"
-        
     return None, None, "NSE"
 
 def get_live_ltp(token, exch):
@@ -127,73 +114,56 @@ def get_live_ltp(token, exch):
         except: pass
     return 0.0
 
-# --- 5. STRATEGY ENGINE (All 6 Included) ---
+# --- 5. STRATEGY ENGINE ---
 def calculate_signals(df, strategy):
     last = df.iloc[-1]
     sig = "HOLD"
-    
-    # Common Indicators
     df['EMA9'] = df.ta.ema(length=9)
     df['EMA21'] = df.ta.ema(length=21)
     df['RSI'] = df.ta.rsi(length=14)
     df['VWAP'] = df.ta.vwap()
     
-    # 1. Sniper (1m Scalp)
     if "Sniper" in strategy:
         if last['EMA9'] > last['EMA21'] and last['RSI'] > 55: sig = "BUY"
         elif last['EMA9'] < last['EMA21'] and last['RSI'] < 45: sig = "SELL"
-    
-    # 2. Momentum (5m Trend)
     elif "Momentum" in strategy:
         if last['Close'] > last['EMA9']: sig = "BUY"
         else: sig = "SELL"
-        
-    # 3. Golden Cross (Pro)
     elif "Golden" in strategy:
         if last['EMA9'] > last['EMA21']: sig = "BUY"
         else: sig = "SELL"
-        
-    # 4. Supertrend (Pro)
     elif "Supertrend" in strategy:
         st_data = df.ta.supertrend(length=10, multiplier=3)
         if st_data is not None:
              df = pd.concat([df, st_data], axis=1)
              if df.iloc[-1]['Close'] > df.iloc[-1][df.columns[-2]]: sig = "BUY"
              else: sig = "SELL"
-
-    # 5. VWAP + MACD (High Accuracy)
     elif "VWAP" in strategy:
         macd = df.ta.macd(fast=12, slow=26, signal=9)
         if macd is not None:
             df = pd.concat([df, macd], axis=1)
             if last['Close'] > last['VWAP'] and last[df.columns[-3]] > last[df.columns[-1]]: sig = "BUY"
             elif last['Close'] < last['VWAP'] and last[df.columns[-3]] < last[df.columns[-1]]: sig = "SELL"
-            
-    # 6. Volume Shock
     elif "Volume" in strategy:
         vol_avg = df['Volume'].rolling(20).mean().iloc[-1]
         if last['Volume'] > (vol_avg * 2):
             if last['Close'] > last['Open']: sig = "BUY"
             else: sig = "SELL"
-
     return sig
 
 @st.cache_data(ttl=10)
 def scan_market(watchlist, strategy):
     data = []
     interval = "1m" if "Sniper" in strategy else "15m" if "VWAP" in strategy else "5m"
-    
     for item in watchlist:
         try:
             df = yf.download(item['code'], period="5d", interval=interval, progress=False)
             if df.empty: continue
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            
             sig = calculate_signals(df, strategy)
             trade_price = df.iloc[-1]['Close']
             token, sym, exch = None, item['symbol'], "NSE"
             
-            # Asset Logic
             if item['type'] == "INDEX":
                 strike = round(trade_price / item['step']) * item['step']
                 otype = "CE" if "BUY" in sig else "PE"
@@ -205,7 +175,6 @@ def scan_market(watchlist, strategy):
             elif item['type'] == "EQUITY":
                 token, sym, exch = get_angel_token(item['symbol'], type_="EQUITY")
 
-            # Live Price
             if token:
                 ltp = get_live_ltp(token, exch)
                 if ltp > 0: trade_price = ltp
@@ -244,20 +213,30 @@ with tab1:
         st.rerun()
 
     st.write("### Signals")
-    for d in data_list:
-        col = "#00e676" if "BUY" in d['sig'] else "#ff1744" if "SELL" in d['sig'] else "#333"
-        st.markdown(f"<div class='card' style='border-left:4px solid {col}'><b>{d['display']}</b>: {d['price']:.2f} | {d['sig']}</div>", unsafe_allow_html=True)
+    if data_list:
+        for d in data_list:
+            col = "#00e676" if "BUY" in d['sig'] else "#ff1744" if "SELL" in d['sig'] else "#333"
+            st.markdown(f"<div class='card' style='border-left:4px solid {col}'><b>{d['display']}</b>: {d['price']:.2f} | {d['sig']}</div>", unsafe_allow_html=True)
+    else:
+        st.info("⏳ Waiting for Market Data...")
 
 with tab2:
     st.info("FII/DII Data & Screener")
-    st.dataframe(pd.DataFrame(data_list)[['display', 'price', 'sig', 'type', 'change']], use_container_width=True)
     
-    st.write("#### FII/DII Trend Simulation")
-    try:
-        nifty_chg = data_list[0]['change'] if data_list else 0
-        sentiment = "BULLISH (Buying)" if nifty_chg > 0 else "BEARISH (Selling)"
-        st.metric("FII Sentiment", sentiment, f"{nifty_chg:.2f}%")
-    except: st.write("No Data")
+    # --- ERROR FIX: CHECK IF DATA EXISTS BEFORE DATAFRAME ---
+    if data_list:
+        df_screen = pd.DataFrame(data_list)
+        if not df_screen.empty:
+            st.dataframe(df_screen[['display', 'price', 'sig', 'type', 'change']], use_container_width=True)
+            
+            st.write("#### FII/DII Trend Simulation")
+            nifty_chg = df_screen.iloc[0]['change']
+            sentiment = "BULLISH (Buying)" if nifty_chg > 0 else "BEARISH (Selling)"
+            st.metric("FII Sentiment", sentiment, f"{nifty_chg:.2f}%")
+        else:
+            st.warning("Data loading...")
+    else:
+        st.warning("⏳ Data is loading... please wait.")
 
 with tab3:
     st.write("#### 🔐 Login")
