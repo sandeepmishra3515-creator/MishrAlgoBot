@@ -48,7 +48,6 @@ if not st.session_state.auth:
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
         st.markdown("<h2 style='text-align:center; color:#00e676;'>🔒 SYSTEM LOCKED</h2>", unsafe_allow_html=True)
-        # type="password" makes it hidden (dots)
         pin = st.text_input("Enter Access Key", type="password", placeholder="••••••••••")
         
         if st.button("UNLOCK 🔓"):
@@ -74,7 +73,7 @@ def check_market_time(exch_type):
     elif exch_type in ["INDEX", "EQUITY"]: return dtime(9, 15) <= now <= dtime(15, 30)
     return False
 
-# --- 5. API HANDLING (Fix for SmartConnect Error) ---
+# --- 5. API HANDLING ---
 API_OK = False
 try:
     from SmartApi import SmartConnect
@@ -142,6 +141,182 @@ def calculate_signals(df, strategy):
         if last['EMA9'] > last['EMA21'] and last['RSI'] > 55: sig = "BUY"
         elif last['EMA9'] < last['EMA21'] and last['RSI'] < 45: sig = "SELL"
     elif "Momentum" in strategy:
+        if last['Close'] > last['EMA9']: sig = "BUY"
+        else: sig = "SELL"
+    elif "Golden" in strategy:
+        if last['EMA9'] > last['EMA21']: sig = "BUY"
+        else: sig = "SELL"
+    elif "Supertrend" in strategy:
+        st_data = df.ta.supertrend(length=10, multiplier=3)
+        if st_data is not None:
+             df = pd.concat([df, st_data], axis=1)
+             if df.iloc[-1]['Close'] > df.iloc[-1][df.columns[-2]]: sig = "BUY"
+             else: sig = "SELL"
+    elif "VWAP" in strategy:
+        macd = df.ta.macd(fast=12, slow=26, signal=9)
+        if macd is not None:
+            df = pd.concat([df, macd], axis=1)
+            # Corrected Indentation Here
+            if last['Close'] > last['VWAP'] and last[df.columns[-3]] > last[df.columns[-1]]: sig = "BUY"
+            elif last['Close'] < last['VWAP'] and last[df.columns[-3]] < last[df.columns[-1]]: sig = "SELL"
+    elif "Volume" in strategy:
+        vol_avg = df['Volume'].rolling(20).mean().iloc[-1]
+        if last['Volume'] > (vol_avg * 2):
+            if last['Close'] > last['Open']: sig = "BUY"
+            else: sig = "SELL"
+    return sig
+
+@st.cache_data(ttl=10)
+def scan_market(watchlist, strategy):
+    data = []
+    interval = "1m" if "Sniper" in strategy else "15m" if "VWAP" in strategy else "5m"
+    for item in watchlist:
+        try:
+            df = yf.download(item['code'], period="5d", interval=interval, progress=False)
+            if df.empty: continue
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            sig = calculate_signals(df, strategy)
+            trade_price = df.iloc[-1]['Close']
+            token, sym, exch = None, item['symbol'], "NSE"
+            
+            if item['type'] == "INDEX":
+                strike = round(trade_price / item['step']) * item['step']
+                otype = "CE" if "BUY" in sig else "PE"
+                token, sym, exch = get_angel_token(item['symbol'], strike, otype, "INDEX")
+                if sig != "HOLD": sig = f"BUY {otype}"
+                trade_price *= 0.01 
+            elif item['type'] == "MCX":
+                token, sym, exch = get_angel_token(item['symbol'], type_="MCX")
+            elif item['type'] == "EQUITY":
+                token, sym, exch = get_angel_token(item['symbol'], type_="EQUITY")
+
+            if token:
+                ltp = get_live_ltp(token, exch)
+                if ltp > 0: trade_price = ltp
+                
+            data.append({
+                "display": sym, "price": trade_price, "sig": sig, 
+                "token": token, "exch": exch, "type": item['type'],
+                "change": ((df.iloc[-1]['Close'] - df.iloc[0]['Open'])/df.iloc[0]['Open'])*100
+            })
+        except: pass
+    return data
+
+# --- 7. UI TABS ---
+c1, c2 = st.columns([4, 1])
+with c1: st.markdown("### 🤖 Mishr@lgobot <span style='color:gold'>PRO</span>", unsafe_allow_html=True)
+with c2: st.markdown(f"<small>Status:</small> {'🟢 ON' if st.session_state.bot_active else '🔴 OFF'}", unsafe_allow_html=True)
+
+data_list = scan_market(st.session_state.watchlist, st.session_state.strategy_mode)
+
+tab1, tab2, tab3, tab4 = st.tabs(["🏠 DASHBOARD", "🔍 SCREENER", "⚙️ CONFIG", "📜 LOGS"])
+
+with tab1:
+    curr_pnl = sum([p['pnl'] for p in st.session_state.positions])
+    total_pnl = st.session_state.daily_pnl + curr_pnl
+    cls = "bull" if total_pnl >= 0 else "bear"
+    
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(f"<div class='card'>Wallet<br><b>₹{st.session_state.bal:,.0f}</b></div>", unsafe_allow_html=True)
+    c2.markdown(f"<div class='card'>P&L<br><span class='{cls}'>₹{total_pnl:.2f}</span></div>", unsafe_allow_html=True)
+    c3.markdown(f"<div class='card'>Active<br><b>{len(st.session_state.positions)}</b></div>", unsafe_allow_html=True)
+    
+    if st.button("🚨 PANIC: EXIT ALL", type="secondary"):
+        st.session_state.bot_active = False
+        st.session_state.positions = []
+        add_log("PANIC EXIT TRIGGERED", "ALERT")
+        st.rerun()
+
+    st.write("### Signals")
+    if data_list:
+        for d in data_list:
+            col = "#00e676" if "BUY" in d['sig'] else "#ff1744" if "SELL" in d['sig'] else "#333"
+            st.markdown(f"<div class='card' style='border-left:4px solid {col}'><b>{d['display']}</b>: {d['price']:.2f} | {d['sig']}</div>", unsafe_allow_html=True)
+    else: st.info("⏳ Waiting for Market Data...")
+
+with tab2:
+    st.info("Market Data")
+    if data_list:
+        df_screen = pd.DataFrame(data_list)
+        if not df_screen.empty:
+            st.dataframe(df_screen[['display', 'price', 'sig', 'type', 'change']], use_container_width=True)
+        else: st.warning("Data loading...")
+    else: st.warning("⏳ Data is loading...")
+
+with tab3:
+    st.write("#### 🔐 Angel One Login")
+    if not st.session_state.smartApi:
+        with st.form("log"):
+            ak = st.text_input("API Key")
+            cid = st.text_input("Client ID")
+            pin = st.text_input("PIN", type="password")
+            totp = st.text_input("TOTP Secret")
+            if st.form_submit_button("CONNECT"):
+                msg, api = angel_login(ak, cid, pin, totp)
+                if api: st.session_state.smartApi = api; st.rerun()
+                else: st.error(msg)
+    else: st.success("Logged In"); st.button("LOGOUT", on_click=lambda: st.session_state.update(smartApi=None))
+
+    st.write("#### 🎮 Strategy")
+    st.session_state.strategy_mode = st.selectbox("Mode", [
+        "1. Sniper (1m) [Scalp]", "2. Momentum (5m) [Trend]", "3. Supertrend (Pro)", 
+        "4. Golden Cross (Pro)", "5. VWAP + MACD (High Acc)", "6. Volume Shock"
+    ])
+    
+    c1, c2 = st.columns([3,1])
+    new = c1.text_input("Add Stock")
+    if c2.button("Add") and new:
+        st.session_state.watchlist.append({"type": "EQUITY", "symbol": new.upper(), "code": f"{new.upper()}.NS", "step": 1})
+        st.rerun()
+        
+    rem = st.selectbox("Remove", [x['symbol'] for x in st.session_state.watchlist])
+    if st.button("Delete"):
+        st.session_state.watchlist = [x for x in st.session_state.watchlist if x['symbol'] != rem]
+        st.rerun()
+    
+    st.write("---")
+    st.session_state.real_trade_active = st.toggle("REAL TRADING", value=st.session_state.real_trade_active)
+    if st.button("▶ START", type="primary"): st.session_state.bot_active = True; st.rerun()
+    if st.button("🛑 STOP"): st.session_state.bot_active = False; st.rerun()
+
+with tab4:
+    st.download_button("Download Logs", "\n".join(st.session_state.logs), "logs.txt")
+    st.text_area("Logs", "\n".join(st.session_state.logs), height=300)
+
+# --- 8. BOT LOOP ---
+if st.session_state.bot_active:
+    for d in data_list:
+        if not check_market_time(d['type']): continue
+        # Entry
+        if "BUY" in d['sig'] and not any(p['display'] == d['display'] for p in st.session_state.positions):
+            qty = st.session_state.manual_qty
+            mode = "PAPER"
+            if st.session_state.real_trade_active and d['token'] and st.session_state.smartApi:
+                try:
+                    p = {"variety":"NORMAL", "tradingsymbol":d['display'], "symboltoken":d['token'], "transactiontype":"BUY", "exchange":d['exch'], "ordertype":"MARKET", "producttype":"INTRADAY", "duration":"DAY", "quantity":str(qty)}
+                    st.session_state.smartApi.placeOrder(p); mode = "REAL"
+                except: mode = "FAIL"
+            
+            if mode != "FAIL":
+                st.session_state.positions.append({"display":d['display'], "entry":d['price'], "qty":qty, "pnl":0.0, "type":mode})
+                add_log(f"Entry: {d['display']}", mode)
+    
+    # Exit
+    for p in st.session_state.positions[:]:
+        curr = p['entry']
+        match = next((x for x in data_list if x['display'] == p['display']), None)
+        if match: curr = match['price']
+        
+        p['pnl'] = (curr - p['entry']) * p['qty']
+        pct = ((curr - p['entry']) / p['entry']) * 100
+        
+        if pct <= -st.session_state.sl_pct or pct >= st.session_state.target_pct:
+            st.session_state.daily_pnl += p['pnl']
+            st.session_state.positions.remove(p)
+            add_log(f"Exit {p['display']} PnL: {p['pnl']}", "EXIT")
+
+    time.sleep(5)
+    st.rerun()
         if last['Close'] > last['EMA9']: sig = "BUY"
         else: sig = "SELL"
     elif "Golden" in strategy:
@@ -488,4 +663,5 @@ if st.session_state.bot_active:
 
     time.sleep(5)
     st.rerun()
+
 
